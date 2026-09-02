@@ -827,10 +827,70 @@ test("an omittable discriminator claims undefined", () => {
   expect(z.union(options).safeParse({ x: "s" }).success).toEqual(true);
   expect(z.discriminatedUnion("k", options).safeParse({ k: "b", y: 1 }).success).toEqual(true);
 
-  // two options omit the key: both claim undefined, so they are not discriminable on it
+  // two options both omit the key: undefined is ambiguous, so it drops from the fast-path map
   for (const k of omittable) {
-    expect(() =>
-      z.discriminatedUnion("k", [z.object({ k }), z.object({ k: z.exactOptional(z.literal("c")) })]).parse({})
-    ).toThrow(/Duplicate discriminator value "undefined"/);
+    const opts = [z.object({ k }), z.object({ k: z.exactOptional(z.literal("c")) })] as const;
+    const union = z.discriminatedUnion("k", opts);
+    // schema construction must succeed — no throw at construction or parse time
+    expect(union).toBeDefined();
+    // absent key is ambiguous — without unionFallback, fails with no matching discriminator
+    expect(() => union.safeParse({})).not.toThrow();
+    expect(union.safeParse({}).success).toBe(false);
+    // with unionFallback, it falls back to union scan
+    expect(z.discriminatedUnion("k", opts, { unionFallback: true }).safeParse({}).success).toBe(true);
   }
+});
+
+// Regression: discriminatedUnion with .default() discriminators must not throw at parse time (#6545)
+test(".default() discriminators: no throw, fast-path routes explicit tags", () => {
+  const A = z.object({ type: z.literal("a").default("a"), x: z.number() });
+  const B = z.object({ type: z.literal("b").default("b"), y: z.number() });
+  const U = z.discriminatedUnion("type", [A, B]);
+
+  // explicit tags route correctly via fast path
+  expect(U.safeParse({ type: "a", x: 1 }).success).toBe(true);
+  expect(U.safeParse({ type: "b", y: 2 }).success).toBe(true);
+
+  // absent discriminator is ambiguous — without unionFallback, fails cleanly with invalid_union
+  expect(U.safeParse({ x: 1 }).success).toBe(false);
+
+  // with unionFallback: true, falls through to union scan and succeeds
+  const UFallback = z.discriminatedUnion("type", [A, B], { unionFallback: true });
+  expect(UFallback.safeParse({ x: 1 }).success).toBe(true);
+  expect(UFallback.safeParse({ x: 1 }).data).toMatchObject({ type: "a", x: 1 });
+
+  // wrong explicit tag — neither option matches
+  expect(U.safeParse({ type: "c", x: 1 }).success).toBe(false);
+});
+
+test(".optional() discriminators: no throw, fast-path routes explicit tags", () => {
+  const C = z.object({ type: z.literal("c").optional(), z: z.boolean() });
+  const D = z.object({ type: z.literal("d").optional(), w: z.string() });
+  const U = z.discriminatedUnion("type", [C, D]);
+
+  expect(U.safeParse({ type: "c", z: true }).success).toBe(true);
+  expect(U.safeParse({ type: "d", w: "hi" }).success).toBe(true);
+});
+
+test("unique .default() still routes via fast path when only one option is omittable", () => {
+  // only A is omittable; undefined maps uniquely to A, so safeParse({}) should succeed via fast-path
+  const A = z.object({ type: z.literal("a").default("a"), x: z.number() });
+  const B = z.object({ type: z.literal("b"), y: z.number() });
+  const U = z.discriminatedUnion("type", [A, B]);
+
+  expect(U.safeParse({ type: "a", x: 1 }).success).toBe(true);
+  expect(U.safeParse({ type: "b", y: 2 }).success).toBe(true);
+  // absent key uniquely routes to A
+  expect(U.safeParse({ x: 3 }).success).toBe(true);
+});
+
+test("z.lazy() over discriminatedUnion with .default() discriminators parses correctly", () => {
+  const Node: any = z.lazy(() =>
+    z.discriminatedUnion("type", [
+      z.object({ type: z.literal("a").default("a"), x: z.number() }),
+      z.object({ type: z.literal("b").default("b"), y: z.number() }),
+    ])
+  );
+  expect(Node.safeParse({ type: "a", x: 1 }).success).toBe(true);
+  expect(Node.safeParse({ type: "b", y: 2 }).success).toBe(true);
 });
